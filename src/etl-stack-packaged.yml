@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Raw Data S3 + Lambda Cloudformation setup
+Parameters:
+  YourName:
+    Type: String
+    Description: name of project to be added as prefix to all buckets etc
+    Default: roast-me
+  NetworkStackName:
+    Type: String
+    Description: network stack with vpc containing redshift instance
+    Default: project-networking
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Automatically look up the latest AMI for Amazon Linux v2
+  EC2InstanceProfileRoleName:
+    Type: String
+    Default: de-academy-ec2-role-instance-profile
+    Description: The shared EC2 instance profile name to use
+  EC2InstanceIngressIp:
+    Type: String
+    Description: Custom IP address for Grafana HTTP ingress rule
+  EC2UserData:
+    Type: String
+    Default: ''
+    Description: User data script to run on EC2 server boot
+Resources:
+  EtlLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: ${YourName}-project-etl-lambda
+      Runtime: python3.12
+      Handler: raw_data_etl_lambda.lambda_handler
+      Role:
+        Fn::Sub: arn:aws:iam::${AWS::AccountId}:role/lambda-execution-role
+      Timeout: 200
+      ReservedConcurrentExecutions: 10
+      Code:
+        S3Bucket:
+          Fn::Sub: ${YourName}-raw-deployment-bucket
+        S3Key: lambda_code.zip
+      VpcConfig:
+        SecurityGroupIds:
+        - Fn::ImportValue:
+            Fn::Sub: ${NetworkStackName}-VPCSGID
+        SubnetIds:
+        - Fn::ImportValue:
+            Fn::Sub: ${NetworkStackName}-PrivateSubnet0ID
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${YourName}-shopper-etl-lambda
+      Environment:
+        Variables:
+          SSM_PARAMETER_NAME:
+            Fn::Join:
+            - _
+            - Fn::Split:
+              - '-'
+              - Fn::Sub: roast_me_redshift_settings
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+    - RawDataBucketPermission
+    - EtlLambdaFunction
+    Properties:
+      BucketName:
+        Fn::Sub: ${YourName}-raw-data
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: s3:ObjectCreated:*
+          Function:
+            Fn::GetAtt:
+            - EtlLambdaFunction
+            - Arn
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${YourName}-raw-data
+  RawDataBucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: EtlLambdaFunction
+      Principal: s3.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:aws:s3:::${YourName}-raw-data
+  RawDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: RawDataBucket
+      PolicyDocument:
+        Statement:
+        - Sid: AllowSSLRequestsOnly
+          Action: s3:*
+          Principal: '*'
+          Effect: Deny
+          Resource:
+          - Fn::Sub: arn:aws:s3:::${YourName}-raw-data
+          - Fn::Sub: arn:aws:s3:::${YourName}-raw-data/*
+          Condition:
+            Bool:
+              aws:SecureTransport: 'false'
+  GrafanaEc2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId:
+        Ref: LatestAmiId
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${YourName}-shopper-ec2-grafana
+      NetworkInterfaces:
+      - AssociatePublicIpAddress: true
+        DeviceIndex: '0'
+        SubnetId:
+          Fn::ImportValue:
+            Fn::Sub: ${NetworkStackName}-PublicSubnet0ID
+        GroupSet:
+        - Fn::ImportValue:
+            Fn::Sub: ${NetworkStackName}-VPCSGID
+        - Fn::GetAtt: GrafanaEC2InstanceSecurityGroup.GroupId
+      LaunchTemplate:
+        LaunchTemplateId:
+          Ref: GrafanaEC2LaunchTemplate
+        Version:
+          Fn::GetAtt:
+          - GrafanaEC2LaunchTemplate
+          - LatestVersionNumber
+  GrafanaEC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName:
+        Fn::Sub: ${YourName}-shopper-ec2-grafana-launch-template
+      VersionDescription: '01'
+      LaunchTemplateData:
+        UserData:
+          Ref: EC2UserData
+        IamInstanceProfile:
+          Name:
+            Ref: EC2InstanceProfileRoleName
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpProtocolIpv6: disabled
+          HttpPutResponseHopLimit: 10
+          HttpTokens: optional
+          InstanceMetadataTags: enabled
+        Monitoring:
+          Enabled: true
+        BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 8
+            Encrypted: true
+            DeleteOnTermination: true
+  GrafanaEC2InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Sets ingress and egress rules for HTTP, HTTPS and SSH
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${YourName}-shopper-ec2-grafana
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp:
+          Fn::Sub: ${EC2InstanceIngressIp}/32
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp:
+          Fn::Sub: ${EC2InstanceIngressIp}/32
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
